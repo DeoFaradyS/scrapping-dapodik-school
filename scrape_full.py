@@ -10,36 +10,33 @@ CARA PAKAI:
 
     python scrape_full.py --provinsi "Gorontalo"
     python scrape_full.py --provinsi "Gorontalo,Bali"
+    python scrape_full.py --provinsi "Surabaya" --kabkota "Surabaya"
     python scrape_full.py --jenjang "SD,SMP"            # cuma jenjang tertentu
     python scrape_full.py --provinsi "Gorontalo" --jenjang "SD"
-    python scrape_full.py                              # semua provinsi & jenjang, auto-skip yang selesai
-    python scrape_full.py --ulang --provinsi "Gorontalo"
-    python scrape_full.py --test                       # 1 provinsi, 1 kab, 1 kec doang
-    python scrape_full.py --debug                       # browser kelihatan
+    python scrape_full.py                              # semua provinsi & jenjang
 
 OUTPUT:
-    {NamaProvinsi}.xlsx    -> 1 file per provinsi, isi semua jenjang (SD/SMP/SMA/SMK)
-    progress_selesai.txt   -> "Jenjang|Provinsi" yang udah kelar, run berikutnya auto-skip
+    {Provinsi}_{KabKota}_{Jenjang}.xlsx   -> 1 file per kombo provinsi+kab/kota+jenjang
+    Tiap run scrape fresh sesuai filter, gak ada resume/skip antar-run.
 """
 
 import asyncio
-import os
 import re
 import sys
 import pandas as pd
 from playwright.async_api import async_playwright
 
 BASE = "https://dapo.kemendikdasmen.go.id"
-PROGRESS_FILE = "progress_selesai.txt"
 ROW_SELECTOR = "tr.cursor-pointer"
 LEVEL_NAMES = ["Kab/Kota", "Kecamatan", "Sekolah"]  # depth 1, 2, 3
 JENJANG_LIST = ["SD", "SMP", "SMA", "SMK"]  # fix, semua jenjang selalu diambil
+RETRY_MAKS = 4
+FIELD_WAJIB = ["NPSN", "Nama Sekolah", "Status"]  # kosong -> PERLU_CEK_MANUAL
 
-STATS = {"sekolah": 0, "gagal": 0}
+STATS = {"sekolah": 0, "gagal": 0, "cek_manual": 0}
 
 DEBUG = "--debug" in sys.argv
 TEST = "--test" in sys.argv
-ULANG = "--ulang" in sys.argv
 
 
 def ambil_arg_list(flag, default):
@@ -51,9 +48,20 @@ def ambil_arg_list(flag, default):
     return [s.strip() for s in sys.argv[idx + 1].split(",")]
 
 
+def normalize(nama):
+    """lowercase + trim + rapetin spasi + strip prefix Kab./Kota/Prov. biar 'Surabaya' match 'Kota Surabaya'."""
+    n = re.sub(r"\s+", " ", nama.strip().lower())
+    n = re.sub(r"^(kab\.?|kabupaten|kota|prov\.?|provinsi)\s+", "", n)
+    return n.strip()
+
+
 PROVINSI_FILTER = ambil_arg_list("--provinsi", None)
 if PROVINSI_FILTER:
-    PROVINSI_FILTER = [s.lower() for s in PROVINSI_FILTER]
+    PROVINSI_FILTER = [normalize(s) for s in PROVINSI_FILTER]
+
+KABKOTA_FILTER = ambil_arg_list("--kabkota", None)
+if KABKOTA_FILTER:
+    KABKOTA_FILTER = [normalize(s) for s in KABKOTA_FILTER]
 
 JENJANG_FILTER = ambil_arg_list("--jenjang", JENJANG_LIST)
 JENJANG_FILTER = [s.strip().upper() for s in JENJANG_FILTER]
@@ -69,34 +77,19 @@ def start_url(jenjang):
     return f"{BASE}/progres?jenjang={jenjang}&status_sekolah=Swasta"
 
 
-# ---------- progress & penyimpanan ----------
+# ---------- penyimpanan ----------
 
-def baca_progress_selesai():
-    if not os.path.exists(PROGRESS_FILE):
-        return set()
-    with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-        return set(line.strip() for line in f if line.strip())
-
-
-def tandai_selesai(key):
-    with open(PROGRESS_FILE, "a", encoding="utf-8") as f:
-        f.write(key + "\n")
-
-
-def simpan_provinsi_incremental(nama_prov, rows_baru):
-    """Simpan/gabung ke file excel per provinsi, misal 'Gorontalo.xlsx'."""
-    if not rows_baru:
-        return
-    file_out = f"{nama_prov}.xlsx"
-    df_baru = pd.DataFrame(rows_baru)
-    if os.path.exists(file_out):
-        try:
-            df_lama = pd.read_excel(file_out)
-            df_baru = pd.concat([df_lama, df_baru], ignore_index=True)
-        except Exception:
-            pass
-    df_baru.to_excel(file_out, index=False)
-    return file_out
+def simpan_hasil(jenjang, nama_prov, hasil):
+    """Pecah hasil satu provinsi jadi 1 file per Kab/Kota: '{Prov}_{KabKota}_{Jenjang}.xlsx'."""
+    if not hasil:
+        return []
+    df = pd.DataFrame(hasil)
+    files = []
+    for kabkota, grup in df.groupby("Kab/Kota", dropna=False):
+        file_out = bersihkan_nama_file(f"{nama_prov}_{kabkota}_{jenjang}") + ".xlsx"
+        grup.to_excel(file_out, index=False)
+        files.append(file_out)
+    return files
 
 
 # ---------- parsing nama dari row tabel ----------
@@ -170,21 +163,33 @@ async def goto_aman(page, url, tries=4, wait_until="networkidle", timeout=90000)
     return False
 
 
-async def klik_baris_aman(page, index, tries=4, timeout=45000):
-    """Klik baris ke-`index` di tabel, re-query tiap percobaan biar gak stale."""
-    for _ in range(tries):
+def cari_index_by_nama(rows, nama, fallback_label):
+    """Cari baris yg nama-nya cocok. None kalo gak ketemu/ambigu (biar caller fallback ke index)."""
+    cocok = [i for i, (_, cols) in enumerate(rows)
+             if nama_dari_cols(cols, fallback_label) == nama]
+    return cocok[0] if len(cocok) == 1 else None
+
+
+async def klik_baris_aman(page, index, nama=None, fallback_label="row", tries=RETRY_MAKS, timeout=45000):
+    """Klik baris. Percobaan pertama pake index asli. Percobaan berikutnya (abis reload
+    parent) cari ulang baris via cocok nama persis dulu, kalo ambigu/gak ketemu baru fallback index."""
+    for percobaan in range(tries):
         try:
             rows = await get_rows_text(page)
-            if index >= len(rows):
+            target = index
+            if percobaan > 0 and nama:
+                found = cari_index_by_nama(rows, nama, fallback_label)
+                target = found if found is not None else index
+            if target >= len(rows):
                 return False
-            row_el, _ = rows[index]
+            row_el, _ = rows[target]
             async with page.expect_navigation(wait_until="networkidle", timeout=timeout):
                 await row_el.click()
             await page.wait_for_timeout(2000)
             return True
         except Exception:
             await page.wait_for_timeout(2000)
-    print(f"        [!] klik baris {index} gagal total")
+    print(f"        [!] klik baris {index} ({nama}) gagal total")
     return False
 
 
@@ -204,12 +209,17 @@ async def crawl(page, jenjang, path, parent_url, depth, hasil):
         if i >= len(rows_now):
             continue
         _, cols = rows_now[i]
-        nama = bersihkan_nama_file(nama_dari_cols(cols, f"{label.lower()}_{i+1}"))
+        fallback_label = f"{label.lower()}_{i+1}"
+        nama = bersihkan_nama_file(nama_dari_cols(cols, fallback_label))
+
+        if depth == 1 and KABKOTA_FILTER and not any(f in normalize(nama) for f in KABKOTA_FILTER):
+            continue
+
         path_baru = path + [nama]
 
-        ok = await klik_baris_aman(page, i)
+        ok = await klik_baris_aman(page, i, nama=nama_dari_cols(cols, fallback_label), fallback_label=fallback_label)
         if not ok:
-            hasil.append(baris_gagal(jenjang, path_baru, f"GAGAL buka {label}"))
+            hasil.append(baris_gagal(jenjang, path_baru, f"PERLU_CEK_MANUAL: gagal buka {label}"))
             await goto_aman(page, parent_url)
             continue
         url_sekarang = page.url
@@ -224,6 +234,7 @@ async def crawl(page, jenjang, path, parent_url, depth, hasil):
 
 def baris_gagal(jenjang, path, pesan):
     STATS["gagal"] += 1
+    STATS["cek_manual"] += 1
     kolom = ["Provinsi", "Kab/Kota", "Kecamatan", "Nama Sekolah"]
     row = {"Jenjang": jenjang, "Status": pesan}
     for k, v in zip(kolom, path):
@@ -247,8 +258,7 @@ async def catat_sekolah(page, jenjang, path, hasil):
         print(f"        [!] extract gagal buat {nama_sek}: {e}")
 
     STATS["sekolah"] += 1
-    print(f"        + {nama_sek}  [{STATS['sekolah']} sekolah total | gagal {STATS['gagal']}]")
-    hasil.append({
+    row = {
         "Jenjang": jenjang,
         "Provinsi": path[0],
         "Kab/Kota": path[1],
@@ -256,16 +266,19 @@ async def catat_sekolah(page, jenjang, path, hasil):
         "Nama Sekolah": nama_sek,
         "Status": "sukses",
         **field_data,
-    })
+    }
+    kosong = [f for f in FIELD_WAJIB if not str(row.get(f, "")).strip()]
+    if kosong:
+        row["Status"] = f"PERLU_CEK_MANUAL: kosong ({', '.join(kosong)})"
+        STATS["cek_manual"] += 1
+
+    print(f"        + {nama_sek}  [{STATS['sekolah']} sekolah total | cek manual {STATS['cek_manual']}]")
+    hasil.append(row)
 
 
 # ---------- main ----------
 
 async def main():
-    selesai = baca_progress_selesai()
-    if selesai and not ULANG:
-        print(f"Udah selesai sebelumnya ({len(selesai)}): {', '.join(sorted(selesai))}")
-
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=not DEBUG)
         page = await browser.new_page()
@@ -283,32 +296,28 @@ async def main():
                 if pi >= len(prov_rows):
                     continue
                 _, cols = prov_rows[pi]
-                nama_prov = bersihkan_nama_file(nama_dari_cols(cols, f"provinsi_{pi+1}"))
-                key = f"{jenjang}|{nama_prov}"
+                fallback_label = f"provinsi_{pi+1}"
+                nama_prov = bersihkan_nama_file(nama_dari_cols(cols, fallback_label))
 
-                if key in selesai and not ULANG:
-                    print(f"\n=== {jenjang} - {nama_prov} -> SKIP (udah selesai) ===")
-                    continue
-                if PROVINSI_FILTER and not any(f in nama_prov.lower() for f in PROVINSI_FILTER):
+                if PROVINSI_FILTER and not any(f in normalize(nama_prov) for f in PROVINSI_FILTER):
                     continue
 
                 print(f"\n=== {jenjang} - Provinsi {pi+1}/{len(prov_rows)}: {nama_prov} "
                       f"| {STATS['sekolah']} sekolah terkumpul ===")
                 hasil = []
 
-                ok = await klik_baris_aman(page, pi)
+                ok = await klik_baris_aman(page, pi, nama=nama_dari_cols(cols, fallback_label), fallback_label=fallback_label)
                 if not ok:
-                    hasil.append(baris_gagal(jenjang, [nama_prov], "GAGAL buka provinsi"))
-                    simpan_provinsi_incremental(nama_prov, hasil)
+                    hasil.append(baris_gagal(jenjang, [nama_prov], "PERLU_CEK_MANUAL: gagal buka provinsi"))
+                    simpan_hasil(jenjang, nama_prov, hasil)
                     await goto_aman(page, url_awal)
                     continue
 
                 await crawl(page, jenjang, [nama_prov], page.url, 1, hasil)
 
                 await goto_aman(page, url_awal)
-                file_out = simpan_provinsi_incremental(nama_prov, hasil)
-                tandai_selesai(key)
-                print(f"=== {key} SELESAI, {len(hasil)} baris -> {file_out} ===")
+                files_out = simpan_hasil(jenjang, nama_prov, hasil)
+                print(f"=== {jenjang}|{nama_prov} SELESAI, {len(hasil)} baris -> {len(files_out)} file ===")
 
         print(f"\nSemua target udah diproses.")
         await browser.close()

@@ -1,13 +1,18 @@
 name: Scrape Dapodik
 
 on:
-  workflow_dispatch:   # trigger manual dari tab "Actions" di GitHub
+  workflow_dispatch: # trigger manual dari tab "Actions" di GitHub
+    inputs:
+      kabkota:
+        description: "Filter Kab/Kota (kosongin buat semua), pisah koma kalo lebih dari satu"
+        required: false
+        default: ""
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false   # 1 jenjang gagal, yang lain tetep lanjut
+      fail-fast: false # 1 jenjang gagal, yang lain tetep lanjut
       matrix:
         jenjang: [SD, SMP, SMA, SMK]
 
@@ -24,7 +29,9 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Scrape
-        run: python scrape_full.py --jenjang "${{ matrix.jenjang }}" --provinsi "Jawa Timur"
+        run: |
+          python scrape_full.py --jenjang "${{ matrix.jenjang }}" --provinsi "Jawa Timur" \
+            ${{ github.event.inputs.kabkota != '' && format('--kabkota "{0}"', github.event.inputs.kabkota) || '' }}
 
       - name: Upload hasil
         uses: actions/upload-artifact@v4
