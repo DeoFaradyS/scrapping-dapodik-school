@@ -1,0 +1,4 @@
+SD|Prov. Gorontalo
+SMP|Prov. Gorontalo
+SMA|Prov. Gorontalo
+SMK|Prov. Gorontalo
