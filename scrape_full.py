@@ -10,7 +10,9 @@ CARA PAKAI:
 
     python scrape_full.py --provinsi "Gorontalo"
     python scrape_full.py --provinsi "Gorontalo,Bali"
-    python scrape_full.py                              # semua provinsi, auto-skip yang selesai
+    python scrape_full.py --jenjang "SD,SMP"            # cuma jenjang tertentu
+    python scrape_full.py --provinsi "Gorontalo" --jenjang "SD"
+    python scrape_full.py                              # semua provinsi & jenjang, auto-skip yang selesai
     python scrape_full.py --ulang --provinsi "Gorontalo"
     python scrape_full.py --test                       # 1 provinsi, 1 kab, 1 kec doang
     python scrape_full.py --debug                       # browser kelihatan
@@ -33,6 +35,8 @@ ROW_SELECTOR = "tr.cursor-pointer"
 LEVEL_NAMES = ["Kab/Kota", "Kecamatan", "Sekolah"]  # depth 1, 2, 3
 JENJANG_LIST = ["SD", "SMP", "SMA", "SMK"]  # fix, semua jenjang selalu diambil
 
+STATS = {"sekolah": 0, "gagal": 0}
+
 DEBUG = "--debug" in sys.argv
 TEST = "--test" in sys.argv
 ULANG = "--ulang" in sys.argv
@@ -50,6 +54,9 @@ def ambil_arg_list(flag, default):
 PROVINSI_FILTER = ambil_arg_list("--provinsi", None)
 if PROVINSI_FILTER:
     PROVINSI_FILTER = [s.lower() for s in PROVINSI_FILTER]
+
+JENJANG_FILTER = ambil_arg_list("--jenjang", JENJANG_LIST)
+JENJANG_FILTER = [s.strip().upper() for s in JENJANG_FILTER]
 
 STATUS_BLACKLIST = {
     "sangat baik", "baik", "cukup", "sedang", "kurang", "sangat kurang",
@@ -216,6 +223,7 @@ async def crawl(page, jenjang, path, parent_url, depth, hasil):
 
 
 def baris_gagal(jenjang, path, pesan):
+    STATS["gagal"] += 1
     kolom = ["Provinsi", "Kab/Kota", "Kecamatan", "Nama Sekolah"]
     row = {"Jenjang": jenjang, "Status": pesan}
     for k, v in zip(kolom, path):
@@ -238,7 +246,8 @@ async def catat_sekolah(page, jenjang, path, hasil):
         field_data = {}
         print(f"        [!] extract gagal buat {nama_sek}: {e}")
 
-    print(f"        + {nama_sek}")
+    STATS["sekolah"] += 1
+    print(f"        + {nama_sek}  [{STATS['sekolah']} sekolah total | gagal {STATS['gagal']}]")
     hasil.append({
         "Jenjang": jenjang,
         "Provinsi": path[0],
@@ -261,12 +270,12 @@ async def main():
         browser = await p.chromium.launch(headless=not DEBUG)
         page = await browser.new_page()
 
-        for jenjang in JENJANG_LIST:
+        for ji, jenjang in enumerate(JENJANG_FILTER):
             url_awal = start_url(jenjang)
             await goto_aman(page, url_awal)
 
             prov_rows = await get_rows_text(page)
-            print(f"\n########## Jenjang {jenjang}: {len(prov_rows)} provinsi ##########")
+            print(f"\n########## Jenjang {jenjang} ({ji+1}/{len(JENJANG_FILTER)}): {len(prov_rows)} provinsi ##########")
             jumlah_prov = 1 if TEST else len(prov_rows)
 
             for pi in range(jumlah_prov):
@@ -283,7 +292,8 @@ async def main():
                 if PROVINSI_FILTER and not any(f in nama_prov.lower() for f in PROVINSI_FILTER):
                     continue
 
-                print(f"\n=== {jenjang} - Provinsi {pi+1}/{len(prov_rows)}: {nama_prov} ===")
+                print(f"\n=== {jenjang} - Provinsi {pi+1}/{len(prov_rows)}: {nama_prov} "
+                      f"| {STATS['sekolah']} sekolah terkumpul ===")
                 hasil = []
 
                 ok = await klik_baris_aman(page, pi)

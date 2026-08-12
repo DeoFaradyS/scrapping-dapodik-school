@@ -22,7 +22,6 @@ playwright install chromium
 | `python scrape_full.py --ulang` | Hapus semua progress, mulai dari nol |
 | `python scrape_full.py --test` | Test cepet: 1 provinsi, 1 kab, 1 kec doang |
 | `python scrape_full.py --debug` | Browser kelihatan (buat cek jalannya) |
-| `python scrape_full.py --tanpa-hitung` | Skip fase hitung total di awal, langsung scrape (progress % gak keluar) |
 
 Flag bisa digabung, misal:
 ```bash
@@ -31,9 +30,8 @@ python scrape_full.py --test --debug --provinsi "Gorontalo"
 
 ## Cara Kerja
 
-1. **Fase hitung** (otomatis, kecuali `--tanpa-hitung`): masuk sampe level kecamatan doang buat tau total target sekolah, gak buka detail satu-satu — cepet.
-2. **Fase scrape**: jalan provinsi per provinsi, jenjang per jenjang. Tiap level (kab/kec/sekolah) ada retry 4x kalo gagal buka — kalo tetep gagal, dicatet sebagai baris "GAGAL buka ..." di excel (bukan skip diem-diem).
-3. Progress ditampilin real-time: `[1234/8342 = 14.8% | gagal 3 | 22m10s]`.
+1. Jalan provinsi per provinsi, jenjang per jenjang. Tiap level (kab/kec/sekolah) ada retry 4x kalo gagal buka — kalo tetep gagal, dicatet sebagai baris "GAGAL buka ..." di excel (bukan skip diem-diem).
+2. Progress ditampilin real-time pake counter jalan: `[187 sekolah total | gagal 2]`. Gak ada persen (total sekolah nasional gak diketahui di depan), tapi angka ini nunjukin script masih hidup & terus maju.
 
 ## Output
 
