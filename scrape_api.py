@@ -31,6 +31,9 @@ import json
 import os
 import sys
 from playwright.async_api import async_playwright
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 
 HALAMAN_AWAL = ("https://data.kemendikdasmen.go.id/data-induk/satpen/daftar"
                  "?pembina=kemendikdasmen&jalur=formal&bentuk=sd,smp,sma,smk"
@@ -42,9 +45,11 @@ LIST_API = ("https://api.data.belajar.id/data-portal-backend/v2/master-data/satu
             "&jenisPendidikan=pendidikan-umum,pendidikan-kejuruan&limit={limit}&offset={offset}")
 
 DETAIL_API = "https://api.data.belajar.id/data-portal-backend/v1/master-data/satuan-pendidikan/details/{npsn}"
+PTK_SUMMARY_API = "https://api.data.belajar.id/data-portal-backend/v1/master-data/satuan-pendidikan/details/{npsn}/ptk-summary"
+PD_SUMMARY_API = "https://api.data.belajar.id/data-portal-backend/v2/master-data/satuan-pendidikan/details/{npsn}/pd-summary"
 
 RETRY_MAKS = 4
-BATCH_DETAIL = 15  # berapa banyak detail sekolah ditarik bareng2 (concurrent fetch dalem browser)
+BATCH_DETAIL = 8  # 3 API/sekolah skrg (detail+pd+ptk), turun dr 15 biar gak keblokir rate limit
 
 DEBUG = "--debug" in sys.argv
 TEST = "--test" in sys.argv  # cuma ambil 1 halaman list pertama per provinsi
@@ -162,22 +167,113 @@ async def ambil_daftar_sekolah(page, kode, limit):
 
 
 async def ambil_detail_batch(page, npsn_list):
-    """Tarik detail beberapa NPSN sekaligus (concurrent) dalem 1 browser context."""
-    tugas = [fetch_json(page, DETAIL_API.format(npsn=npsn)) for npsn in npsn_list]
+    """Tarik detail + pd-summary + ptk-summary tiap NPSN paralel (3 API x N sekolah bareng)."""
+    tugas = []
+    for npsn in npsn_list:
+        tugas.append(fetch_json(page, DETAIL_API.format(npsn=npsn)))
+        tugas.append(fetch_json(page, PD_SUMMARY_API.format(npsn=npsn)))
+        tugas.append(fetch_json(page, PTK_SUMMARY_API.format(npsn=npsn)))
     hasil_list = await asyncio.gather(*tugas)
+
     out = {}
-    for npsn, data in zip(npsn_list, hasil_list):
-        if not data:
+    for i, npsn in enumerate(npsn_list):
+        d_detail = hasil_list[i * 3]
+        d_pd = hasil_list[i * 3 + 1]
+        d_ptk = hasil_list[i * 3 + 2]
+
+        if not d_detail:
             STATS["gagal_detail"] += 1
-            out[npsn] = {"Telpon": "", "Email": "", "Naungan": "PERLU_CEK_MANUAL"}
-            continue
-        sp = data.get("satuanPendidikan", {})
+
+        sp = (d_detail or {}).get("satuanPendidikan", {})
+        akreditasi = sp.get("akreditasi") or sp.get("peringkatAkreditasi") or ""
+
+        total_pd = ""
+        if d_pd:
+            total_pd = (d_pd.get("rekapitulasiPesertaDidik", {})
+                        .get("jumlahPesertaDidik", {}).get("total", ""))
+
+        total_ptk = ""
+        if d_ptk:
+            total_ptk = (d_ptk.get("rekapitulasiPtk", {})
+                         .get("jumlahPtk", {}).get("total", ""))
+
         out[npsn] = {
             "Telpon": sp.get("nomorTelepon", "") or "",
             "Email": sp.get("email", "") or "",
-            "Naungan": sp.get("namaYayasan", "") or "",
+            "Akreditasi": akreditasi,
+            "Total Peserta Didik": total_pd,
+            "Total Pendidik": total_ptk,
+            "Naungan": sp.get("namaYayasan", "") if d_detail else "PERLU_CEK_MANUAL",
         }
+        if DEBUG and i == 0:
+            akr = sp.get('akreditasi')
+            pd_status = 'ok' if d_pd else d_pd
+            ptk_status = 'ok' if d_ptk else d_ptk
+            print(f"        [debug] contoh npsn={npsn}: akreditasi_raw={akr!r} pd={pd_status!r} ptk={ptk_status!r}")
     return out
+
+
+def csv_ke_excel(path_csv, path_xlsx, kolom):
+    """Baca CSV, tulis Excel rapi: header tebal warna, auto width, freeze row 1."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Data"
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_align = Alignment(horizontal="center", vertical="center")
+
+    lebar_max = [len(k) for k in kolom]
+
+    with open(path_csv, encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        for r_idx, row in enumerate(reader, 1):
+            ws.append(row)
+            if r_idx == 1:
+                for c_idx, cell in enumerate(ws[r_idx], 1):
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = header_align
+            else:
+                for c_idx, val in enumerate(row):
+                    if c_idx < len(lebar_max):
+                        lebar_max[c_idx] = max(lebar_max[c_idx], len(str(val)))
+
+    for c_idx, lebar in enumerate(lebar_max, 1):
+        ws.column_dimensions[get_column_letter(c_idx)].width = min(lebar + 3, 60)
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    try:
+        wb.save(path_xlsx)
+    except PermissionError:
+        import time
+        print(f"    [!] '{path_xlsx}' lagi kebuka/kekunci, coba lagi 2 detik...")
+        time.sleep(2)
+        try:
+            wb.save(path_xlsx)
+        except PermissionError:
+            base, ext = os.path.splitext(path_xlsx)
+            path_xlsx = f"{base}_baru{ext}"
+            print(f"    [!] masih kekunci, simpen ke '{path_xlsx}' sbg gantinya.")
+            wb.save(path_xlsx)
+    return path_xlsx
+
+
+def buka_file_aman(path, mode, **kwargs):
+    """Coba buka file, kalo lock (kebuka di Excel dll) retry, abis itu fallback nama baru."""
+    import time
+    for percobaan in range(3):
+        try:
+            return open(path, mode, **kwargs), path
+        except PermissionError:
+            print(f"    [!] '{path}' lagi kebuka/kekunci (mgkn lagi dibuka di Excel), coba lagi 2 detik...")
+            time.sleep(2)
+    base, ext = os.path.splitext(path)
+    path_baru = f"{base}_baru{ext}"
+    print(f"    [!] masih kekunci, tulis ke '{path_baru}' sbg gantinya. TUTUP file lama dulu kalo mau nama asli.")
+    return open(path_baru, mode, **kwargs), path_baru
 
 
 async def scrape_provinsi(page, nama_prov, kode):
@@ -188,10 +284,15 @@ async def scrape_provinsi(page, nama_prov, kode):
     rows = await ambil_daftar_sekolah(page, kode, limit)
     print(f"    {len(rows)} sekolah ketemu, mulai ambil detail (telpon/email/naungan)...")
 
-    file_out = bersihkan_nama_file(f"{nama_prov}_Swasta") + ".csv"
-    kolom = ["NPSN", "Nama Sekolah", "Bentuk", "Telpon", "Email", "Naungan", "Kabupaten", "Kecamatan", "Alamat"]
+    folder = bersihkan_nama_file(nama_prov)
+    os.makedirs(folder, exist_ok=True)
 
-    with open(file_out, "w", newline="", encoding="utf-8-sig") as f:
+    file_out = os.path.join(folder, bersihkan_nama_file(f"{nama_prov}_Swasta") + ".csv")
+    kolom = ["NPSN", "Nama Sekolah", "Telpon", "Email", "Akreditasi", "Total Peserta Didik",
+              "Total Pendidik", "Naungan", "Kabupaten", "Kecamatan", "Alamat"]
+
+    f, file_out = buka_file_aman(file_out, "w", newline="", encoding="utf-8-sig")
+    with f:
         writer = csv.DictWriter(f, fieldnames=kolom)
         writer.writeheader()
 
@@ -201,13 +302,17 @@ async def scrape_provinsi(page, nama_prov, kode):
             detail_map = await ambil_detail_batch(page, npsn_list)
 
             for r in batch:
-                detail = detail_map.get(r["npsn"], {"Telpon": "", "Email": "", "Naungan": "PERLU_CEK_MANUAL"})
+                detail = detail_map.get(r["npsn"], {"Telpon": "", "Email": "", "Akreditasi": "",
+                                                       "Total Peserta Didik": "", "Total Pendidik": "",
+                                                       "Naungan": "PERLU_CEK_MANUAL"})
                 row = {
                     "NPSN": r.get("npsn", ""),
                     "Nama Sekolah": r.get("nama", ""),
-                    "Bentuk": r.get("bentukPendidikan", ""),
                     "Telpon": detail["Telpon"],
                     "Email": detail["Email"],
+                    "Akreditasi": detail["Akreditasi"],
+                    "Total Peserta Didik": detail["Total Peserta Didik"],
+                    "Total Pendidik": detail["Total Pendidik"],
                     "Naungan": detail["Naungan"],
                     "Kabupaten": r.get("namaKabupaten", ""),
                     "Kecamatan": r.get("namaKecamatan", ""),
@@ -218,7 +323,10 @@ async def scrape_provinsi(page, nama_prov, kode):
             STATS["sekolah"] += len(batch)
             print(f"        {min(i + BATCH_DETAIL, len(rows))}/{len(rows)} sekolah tercatat...")
 
-    print(f"=== {nama_prov} SELESAI -> {file_out} ({len(rows)} baris) ===")
+    file_xlsx = os.path.join(folder, bersihkan_nama_file(f"{nama_prov}_Swasta") + ".xlsx")
+    file_xlsx = csv_ke_excel(file_out, file_xlsx, kolom)
+
+    print(f"=== {nama_prov} SELESAI -> {file_out} + {file_xlsx} ({len(rows)} baris) ===")
 
 
 async def main():
