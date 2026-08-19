@@ -21,8 +21,15 @@ CARA PAKAI:
 
 OUTPUT:
     {NamaProvinsi}_Swasta.csv  -> 1 file per provinsi
-    Kolom: NPSN | Nama Sekolah | Bentuk | Telpon | Email | Naungan | Kabupaten | Kecamatan | Alamat
+    Kolom: NPSN | Nama Sekolah | Telpon | Email | Akreditasi | Total Peserta Didik |
+           Total Pendidik | Naungan | Kabupaten | Kecamatan | Alamat
     Ditulis streaming per baris, gak numpuk di memory.
+
+CATATAN AKURASI (v2):
+    - Dedupe NPSN di tahap list (server kadang balikin baris sama 2x).
+    - List API gagal -> retry lebih gigih (data vital, jgn gampang nyerah).
+    - Detail API gagal (masuk PERLU_CEK_MANUAL) -> di-retry pelan di akhir
+      per-provinsi, batch kecil, sebelum nyerah beneran.
 """
 
 import asyncio
@@ -41,20 +48,34 @@ HALAMAN_AWAL = ("https://data.kemendikdasmen.go.id/data-induk/satpen/daftar"
 
 LIST_API = ("https://api.data.belajar.id/data-portal-backend/v2/master-data/satuan-pendidikan"
             "/daftar-data-induk/{kode}?pembina=kemendikdasmen&jalurPendidikan=formal"
-            "&bentukPendidikan=sd,smp,sma,smk&statusSatuanPendidikan=2"
+            "&bentukPendidikan={bentuk}&statusSatuanPendidikan=2"
             "&jenisPendidikan=pendidikan-umum,pendidikan-kejuruan&limit={limit}&offset={offset}")
+
+BENTUK_LIST = ["sd", "smp", "sma", "smk"]  # pecah per bentuk - gabungan "sd,smp,sma,smk"
+                                             # kepotong lbh awal drpd meta.total (server bug)
 
 DETAIL_API = "https://api.data.belajar.id/data-portal-backend/v1/master-data/satuan-pendidikan/details/{npsn}"
 PTK_SUMMARY_API = "https://api.data.belajar.id/data-portal-backend/v1/master-data/satuan-pendidikan/details/{npsn}/ptk-summary"
 PD_SUMMARY_API = "https://api.data.belajar.id/data-portal-backend/v2/master-data/satuan-pendidikan/details/{npsn}/pd-summary"
 
 RETRY_MAKS = 4
-BATCH_DETAIL = 8  # 3 API/sekolah skrg (detail+pd+ptk), turun dr 15 biar gak keblokir rate limit
+RETRY_LIST = RETRY_MAKS * 2   # list API vital -> retry 2x lipat drpd detail
+BATCH_DETAIL = 8              # 3 API/sekolah (detail+pd+ptk)
+BATCH_RETRY_DETAIL = 3        # batch retry akhir, lebih kecil = lebih pelan = lebih akurat
 
 DEBUG = "--debug" in sys.argv
 TEST = "--test" in sys.argv  # cuma ambil 1 halaman list pertama per provinsi
 
 STATS = {"sekolah": 0, "gagal_detail": 0}
+
+KOLOM = ["NPSN", "Nama Sekolah", "Telpon", "Email", "Akreditasi", "Total Peserta Didik",
+         "Total Pendidik", "Naungan", "Kabupaten", "Kecamatan", "Alamat"]
+
+DETAIL_KOSONG = {
+    "Telpon": "", "Email": "", "Akreditasi": "",
+    "Total Peserta Didik": "", "Total Pendidik": "",
+    "Naungan": "PERLU_CEK_MANUAL",
+}
 
 # JS snippet: fetch() dari dalem browser context, return JSON atau {__error: status}
 JS_FETCH = """
@@ -133,37 +154,95 @@ def bersihkan_nama_file(nama):
     return nama[:150] if nama else "tanpa_nama"
 
 
-async def deteksi_limit(page, kode):
+async def deteksi_limit(page, kode, bentuk):
     for coba in (100, 50, 20):
-        url = LIST_API.format(kode=kode, limit=coba, offset=0)
+        url = LIST_API.format(kode=kode, bentuk=bentuk, limit=coba, offset=0)
         data = await fetch_json(page, url, tries=2)
         if data and data.get("meta", {}).get("limit") == coba:
             return coba
     return 20
 
 
-async def ambil_daftar_sekolah(page, kode, limit):
-    semua = []
-    offset = 0
+async def ambil_satu_bentuk(page, kode, bentuk, limit, seen, offset_gagal_total):
+    """Full pagination utk 1 bentuk (sd/smp/sma/smk) doang, dedupe by NPSN ke `seen` bareng.
+
+    Query gabungan "sd,smp,sma,smk" kepotong duluan sblm nyampe meta.total (server
+    bug/salah handle multi-value filter) - pecah per bentuk biar tiap query lbh
+    kecil & konsisten sampe abis.
+    """
+    MAX_PASS = 3
     total = None
-    while True:
-        url = LIST_API.format(kode=kode, limit=limit, offset=offset)
-        data = await fetch_json(page, url)
-        if not data:
-            print(f"        [!] gagal ambil list @ offset {offset}, skip sisanya.")
+
+    async def satu_pass():
+        nonlocal total
+        offset = 0
+        gagal = []
+        gagal_beruntun = 0
+        sebelum = len(seen)
+        while True:
+            if total and offset > total * 3 + 200:
+                print(f"        [!] [{bentuk}] offset {offset} jauh lewatin total {total}, stop paksa (safety cap)")
+                break
+
+            url = LIST_API.format(kode=kode, bentuk=bentuk, limit=limit, offset=offset)
+            data = await fetch_json(page, url, tries=RETRY_LIST)
+            if not data:
+                gagal.append(offset)
+                gagal_beruntun += 1
+                offset += limit
+                if gagal_beruntun >= 5:
+                    break
+                continue
+            gagal_beruntun = 0
+
+            rows = data.get("data", [])
+            if total is None:
+                total = data.get("meta", {}).get("total", 0)
+                print(f"        [{bentuk}] total: {total}")
+            for r in rows:
+                npsn = r.get("npsn")
+                if npsn:
+                    seen[npsn] = r
+
+            offset += limit
+            if TEST:
+                break
+            if not rows:
+                break  # satu-satunya sinyal akhir data yg valid
+        return gagal, len(seen) - sebelum
+
+    pass_ke = 0
+    awal = len(seen)
+    gagal_terakhir = []
+    for pass_ke in range(1, MAX_PASS + 1):
+        gagal, baru = await satu_pass()
+        gagal_terakhir = gagal  # cuma simpen dr pass paling akhir - gagal di pass
+                                 # sblmnya biasanya udah ketutup pass abis ini
+        print(f"        [{bentuk}] pass {pass_ke}/{MAX_PASS}: +{baru} baru, total unik {len(seen)}")
+        if baru == 0 and pass_ke > 1:
             break
-        rows = data.get("data", [])
-        meta = data.get("meta", {})
-        if total is None:
-            total = meta.get("total", 0)
-            print(f"        total sekolah: {total}")
-        semua.extend(rows)
-        offset += limit
-        if TEST:
-            break
-        if offset >= total or not rows:
-            break
-    return semua
+
+    tercapai = len(seen) - awal
+    if total and tercapai >= total:
+        gagal_terakhir = []  # datanya udah lengkap, gagal transient sblmnya gak relevan lg
+
+    offset_gagal_total.update(
+        LIST_API.format(kode=kode, bentuk=bentuk, limit=limit, offset=o) for o in gagal_terakhir
+    )
+
+
+async def ambil_daftar_sekolah(page, kode, limit):
+    """List semua sekolah per wilayah, pecah per bentuk (sd/smp/sma/smk), dedupe by NPSN."""
+    seen = {}
+    offset_gagal_total = set()
+    for bentuk in BENTUK_LIST:
+        await ambil_satu_bentuk(page, kode, bentuk, limit, seen, offset_gagal_total)
+
+    print(f"        total sekolah unik semua bentuk: {len(seen)}")
+    if offset_gagal_total:
+        print(f"        [!] {len(offset_gagal_total)} offset gagal HTTP, cek manual")
+
+    return list(seen.values()), sorted(offset_gagal_total)
 
 
 async def ambil_detail_batch(page, npsn_list):
@@ -182,9 +261,10 @@ async def ambil_detail_batch(page, npsn_list):
         d_ptk = hasil_list[i * 3 + 2]
 
         if not d_detail:
-            STATS["gagal_detail"] += 1
+            out[npsn] = None  # sinyal "gagal total", biar caller bisa retry
+            continue
 
-        sp = (d_detail or {}).get("satuanPendidikan", {})
+        sp = d_detail.get("satuanPendidikan", {})
         akreditasi = sp.get("akreditasi") or sp.get("peringkatAkreditasi") or ""
 
         total_pd = ""
@@ -203,14 +283,29 @@ async def ambil_detail_batch(page, npsn_list):
             "Akreditasi": akreditasi,
             "Total Peserta Didik": total_pd,
             "Total Pendidik": total_ptk,
-            "Naungan": sp.get("namaYayasan", "") if d_detail else "PERLU_CEK_MANUAL",
+            "Naungan": sp.get("namaYayasan", "") or "",
         }
         if DEBUG and i == 0:
-            akr = sp.get('akreditasi')
             pd_status = 'ok' if d_pd else d_pd
             ptk_status = 'ok' if d_ptk else d_ptk
-            print(f"        [debug] contoh npsn={npsn}: akreditasi_raw={akr!r} pd={pd_status!r} ptk={ptk_status!r}")
+            print(f"        [debug] contoh npsn={npsn}: akreditasi_raw={akreditasi!r} pd={pd_status!r} ptk={ptk_status!r}")
     return out
+
+
+def baris_dari_detail(r, detail):
+    return {
+        "NPSN": r.get("npsn", ""),
+        "Nama Sekolah": r.get("nama", ""),
+        "Telpon": detail["Telpon"],
+        "Email": detail["Email"],
+        "Akreditasi": detail["Akreditasi"],
+        "Total Peserta Didik": detail["Total Peserta Didik"],
+        "Total Pendidik": detail["Total Pendidik"],
+        "Naungan": detail["Naungan"],
+        "Kabupaten": r.get("namaKabupaten", ""),
+        "Kecamatan": r.get("namaKecamatan", ""),
+        "Alamat": r.get("alamatJalan", ""),
+    }
 
 
 def csv_ke_excel(path_csv, path_xlsx, kolom):
@@ -230,7 +325,7 @@ def csv_ke_excel(path_csv, path_xlsx, kolom):
         for r_idx, row in enumerate(reader, 1):
             ws.append(row)
             if r_idx == 1:
-                for c_idx, cell in enumerate(ws[r_idx], 1):
+                for cell in ws[r_idx]:
                     cell.font = header_font
                     cell.fill = header_fill
                     cell.alignment = header_align
@@ -278,53 +373,64 @@ def buka_file_aman(path, mode, **kwargs):
 
 async def scrape_provinsi(page, nama_prov, kode):
     print(f"\n=== {nama_prov} (kode {kode}) ===")
-    limit = await deteksi_limit(page, kode)
+    limit = await deteksi_limit(page, kode, BENTUK_LIST[0])
     print(f"    pake limit={limit} per request")
 
-    rows = await ambil_daftar_sekolah(page, kode, limit)
-    print(f"    {len(rows)} sekolah ketemu, mulai ambil detail (telpon/email/naungan)...")
+    rows, urls_gagal = await ambil_daftar_sekolah(page, kode, limit)
+    print(f"    {len(rows)} sekolah unik ketemu, mulai ambil detail (telpon/email/naungan)...")
 
     folder = bersihkan_nama_file(nama_prov)
     os.makedirs(folder, exist_ok=True)
 
+    if urls_gagal:
+        log_path = os.path.join(folder, bersihkan_nama_file(f"{nama_prov}_list_gagal") + ".txt")
+        with open(log_path, "w", encoding="utf-8") as lf:
+            lf.write("\n".join(urls_gagal))
+        print(f"    [!] {len(urls_gagal)} URL list gagal ditulis ke {log_path}, cek manual (buka di browser)")
+
     file_out = os.path.join(folder, bersihkan_nama_file(f"{nama_prov}_Swasta") + ".csv")
-    kolom = ["NPSN", "Nama Sekolah", "Telpon", "Email", "Akreditasi", "Total Peserta Didik",
-              "Total Pendidik", "Naungan", "Kabupaten", "Kecamatan", "Alamat"]
 
     f, file_out = buka_file_aman(file_out, "w", newline="", encoding="utf-8-sig")
     with f:
-        writer = csv.DictWriter(f, fieldnames=kolom)
+        writer = csv.DictWriter(f, fieldnames=KOLOM)
         writer.writeheader()
 
+        retry_list = []
         for i in range(0, len(rows), BATCH_DETAIL):
             batch = rows[i:i + BATCH_DETAIL]
             npsn_list = [r["npsn"] for r in batch]
             detail_map = await ambil_detail_batch(page, npsn_list)
 
             for r in batch:
-                detail = detail_map.get(r["npsn"], {"Telpon": "", "Email": "", "Akreditasi": "",
-                                                       "Total Peserta Didik": "", "Total Pendidik": "",
-                                                       "Naungan": "PERLU_CEK_MANUAL"})
-                row = {
-                    "NPSN": r.get("npsn", ""),
-                    "Nama Sekolah": r.get("nama", ""),
-                    "Telpon": detail["Telpon"],
-                    "Email": detail["Email"],
-                    "Akreditasi": detail["Akreditasi"],
-                    "Total Peserta Didik": detail["Total Peserta Didik"],
-                    "Total Pendidik": detail["Total Pendidik"],
-                    "Naungan": detail["Naungan"],
-                    "Kabupaten": r.get("namaKabupaten", ""),
-                    "Kecamatan": r.get("namaKecamatan", ""),
-                    "Alamat": r.get("alamatJalan", ""),
-                }
-                writer.writerow(row)
+                detail = detail_map.get(r["npsn"])
+                if detail is None:
+                    retry_list.append(r)  # gagal total -> coba lagi di akhir
+                    continue
+                writer.writerow(baris_dari_detail(r, detail))
             f.flush()
             STATS["sekolah"] += len(batch)
             print(f"        {min(i + BATCH_DETAIL, len(rows))}/{len(rows)} sekolah tercatat...")
 
+        if retry_list:
+            print(f"    retry {len(retry_list)} sekolah gagal detail, batch kecil pelan-pelan...")
+            masih_gagal = []
+            for i in range(0, len(retry_list), BATCH_RETRY_DETAIL):
+                batch = retry_list[i:i + BATCH_RETRY_DETAIL]
+                npsn_list = [r["npsn"] for r in batch]
+                detail_map = await ambil_detail_batch(page, npsn_list)
+                for r in batch:
+                    detail = detail_map.get(r["npsn"])
+                    if detail is None:
+                        masih_gagal.append(r)
+                        detail = DETAIL_KOSONG
+                        STATS["gagal_detail"] += 1
+                    writer.writerow(baris_dari_detail(r, detail))
+                f.flush()
+            if masih_gagal:
+                print(f"    [!] {len(masih_gagal)} sekolah tetep gagal detail stlh retry -> Naungan='PERLU_CEK_MANUAL'")
+
     file_xlsx = os.path.join(folder, bersihkan_nama_file(f"{nama_prov}_Swasta") + ".xlsx")
-    file_xlsx = csv_ke_excel(file_out, file_xlsx, kolom)
+    file_xlsx = csv_ke_excel(file_out, file_xlsx, KOLOM)
 
     print(f"=== {nama_prov} SELESAI -> {file_out} + {file_xlsx} ({len(rows)} baris) ===")
 
@@ -352,7 +458,8 @@ async def main():
 
         await browser.close()
 
-    print(f"\nSemua selesai. Total {STATS['sekolah']} sekolah, {STATS['gagal_detail']} gagal ambil detail (cek kolom Naungan='PERLU_CEK_MANUAL').")
+    print(f"\nSemua selesai. Total {STATS['sekolah']} sekolah, "
+          f"{STATS['gagal_detail']} gagal ambil detail (cek kolom Naungan='PERLU_CEK_MANUAL').")
 
 
 if __name__ == "__main__":
